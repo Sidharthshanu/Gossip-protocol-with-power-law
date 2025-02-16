@@ -19,17 +19,16 @@ class PeerNode:
         self.ip = ip
         self.port = port
         self.listeningSocket = None
-        self.seeds = []
-        self.peers = []
-        self.seedSockets = []
-        self.peerConnections = []
-        self.peerSockets = []
+        self.seeds = []           # List of seed addresses (ip, port)
+        self.peers = []           # List of peer addresses (ip, port)
+        self.seedSockets = []     # Sockets connected to seeds
+        self.peerConnections = [] # Sockets connected to peers
         self.messageList = []
         self.livenessStatus = {}
         self.sentMessageCount = 0
         self.lastGossipMessageTime = None
         self.lastLivenessMessageTime = None
-        self.socketMapping = {}
+        self.socketMapping = {}   # Maps socket to peer address
         self.allConnections = []
         self.running = True
 
@@ -37,8 +36,8 @@ class PeerNode:
         self.listeningSocket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         self.listeningSocket.bind((self.ip, self.port))
         self.listeningSocket.listen()
-        self.listeningSocket.settimeout(1)  # To avoid blocking indefinitely
-        self.allConnections.append(self.listeningSocket)  # Make sure the listening socket is in the list
+        self.listeningSocket.settimeout(1)  # Avoid blocking indefinitely
+        self.allConnections.append(self.listeningSocket)
 
     def readConfigurations(self, filePath):
         seeds = []
@@ -54,44 +53,43 @@ class PeerNode:
         return seeds
 
     def establishConnections(self):
+        # Connect to seeds only. Seeds are responsible for connecting peers.
         seeds = self.readConfigurations(filePath='config.txt')
+        # Randomize the order so that connection attempts are spread out.
         seeds = random.sample(seeds, len(seeds))
-        allPeers = []
         for seed in seeds:
             sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
             try:
                 sock.connect(seed)
-                peers = pickle.loads(sock.recv(1024))
-                print("List of Peers:", peers)
-                allPeers.extend(peers)
+                # Seeds may send a peer subset for their own topology purposes.
+                # As a peer, we ignore the received data.
+                _ = pickle.loads(sock.recv(1024))
                 self.seeds.append(seed)
                 self.seedSockets.append(sock)
+                # Simply send our address; no additional info is sent.
                 sock.send(str((self.ip, self.port)).encode())
             except Exception as e:
                 print(f"Connection to seed {seed} failed: {e}")
 
-        allPeers = list(set(allPeers))
-        for peer in allPeers:
-            if len(self.peers) >= 4:
-                break
-            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            try:
-                sock.connect(peer)
-                self.peers.append(peer)
-                self.peerSockets.append(sock)
-                self.socketMapping[sock] = peer
-                sock.send(str((self.ip, self.port)).encode())
-            except Exception as e:
-                print(f"Connection to peer {peer} failed: {e}")
+        # (Optionally) If the peer wants to connect to other peers directly,
+        # that logic can be added here—but the seeds have the task of
+        # connecting peers into the network.
 
     def acceptConnection(self):
         try:
-            clientSocket, clientAddress = self.listeningSocket.accept()
-            self.peers.append(clientAddress)
-            self.peerConnections.append(clientSocket)
-            self.socketMapping[clientSocket] = clientAddress
+            clientSocket, _ = self.listeningSocket.accept()
+            # Immediately receive the actual address from the connecting node.
+            data = clientSocket.recv(1024).decode()
+            new_peer = eval(data)  # Expected format: (ip, port)
+            print("New incoming connection from:", new_peer)
+            if new_peer not in self.peers:
+                self.peers.append(new_peer)
+            if clientSocket not in self.peerConnections:
+                self.peerConnections.append(clientSocket)
+            self.socketMapping[clientSocket] = new_peer
             self.allConnections.append(clientSocket)
-            print(f"New connection from {clientAddress}")
+            # For simplicity, just send an acknowledgment.
+            clientSocket.send("ACK".encode())
         except socket.timeout:
             pass
 
@@ -119,35 +117,11 @@ class PeerNode:
             self.livenessStatus.pop(peer, None)
             sock = self.socketMapping.pop(peer, None)
             if sock:
-                self.allConnections.remove(sock)
+                if sock in self.allConnections:
+                    self.allConnections.remove(sock)
                 sock.close()
-            self.peers.remove(peer)
-
-    def activate(self):
-        input_thread = threading.Thread(target=self.acceptInput)
-        input_thread.start()
-
-        while self.running:
-            try:
-                self.allConnections = [s for s in self.allConnections if s.fileno() != -1]
-                if not self.allConnections:
-                    continue
-
-                readable, _, _ = select.select(self.allConnections, [], [], 1)
-                for sock in readable:
-                    if sock == self.listeningSocket:
-                        self.acceptConnection()
-                    else:
-                        message = sock.recv(1024).decode()
-                        if not message:
-                            self.allConnections.remove(sock)
-                            sock.close()
-                        else:
-                            self.handleMessage(sock, message)
-
-            except select.error as e:
-                if e.args[0] not in (errno.EINTR, errno.EBADF):
-                    raise
+            if peer in self.peers:
+                self.peers.remove(peer)
 
     def handleMessage(self, sock, message):
         messageParts = message.split(":")
@@ -158,8 +132,8 @@ class PeerNode:
         elif messageParts[0] == "Liveness Reply":
             self.livenessStatus[eval(messageParts[3])] = 0
         else:
-            # Gossip or other message handling
-            pass
+            # Handle gossip or other message types.
+            print("Received message:", message)
 
     def acceptInput(self):
         while self.running:
@@ -173,7 +147,32 @@ class PeerNode:
     def cleanup(self):
         for sock in self.allConnections:
             sock.close()
-        self.listeningSocket.close()
+        if self.listeningSocket:
+            self.listeningSocket.close()
+
+    def activate(self):
+        input_thread = threading.Thread(target=self.acceptInput)
+        input_thread.start()
+        while self.running:
+            try:
+                self.allConnections = [s for s in self.allConnections if s.fileno() != -1]
+                if not self.allConnections:
+                    continue
+                readable, _, _ = select.select(self.allConnections, [], [], 1)
+                for sock in readable:
+                    if sock == self.listeningSocket:
+                        self.acceptConnection()
+                    else:
+                        message = sock.recv(1024).decode()
+                        if not message:
+                            if sock in self.allConnections:
+                                self.allConnections.remove(sock)
+                            sock.close()
+                        else:
+                            self.handleMessage(sock, message)
+            except select.error as e:
+                if e.args[0] not in (errno.EINTR, errno.EBADF):
+                    raise
 
 def main():
     ip = "127.0.0.1"
