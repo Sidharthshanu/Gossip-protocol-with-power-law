@@ -1,7 +1,12 @@
+#!/usr/bin/env python3
 import socket
 import pickle
 import threading
 import time
+import ast  # for safe literal evaluation
+import numpy as np
+import datetime
+import re
 
 class Peer:
     """
@@ -21,19 +26,15 @@ class Peer:
     def __repr__(self):
         return f"Peer({self.ip}, {self.port}, connections={list(self.connections)})"
 
-
-class peerNodeConnections:
+class SeedNodeConnections:
     """
     Manages the local node's connected peers.
-    Instead of storing just sockets, it stores Peer instances,
-    which include extra information (like the set of connections).
     """
-    def __init__(self, ip, port) -> None:
+    def __init__(self, ip, port):
         self.ip = ip
         self.port = port
         self.running = True
-        # Dictionary mapping (ip, port) to a Peer instance.
-        self.neighbour = {}
+        self.neighbour = {}  # Mapping (ip, port) -> Peer instance
         self.count = 0
 
     def addNeighbour(self, ip, port, socket_obj):
@@ -52,27 +53,40 @@ class peerNodeConnections:
             return True
         return False
 
-
 class SeedNode:
-    def __init__(self, ip, port) -> None:
+    def __init__(self, ip, port):
         self.ip = ip
         self.port = port
         self.socket = None
         self.running = True
-        # Use peerNodeConnections to manage direct peer connections.
-        self.peer_connections = peerNodeConnections(ip, port)
-        # List of known seeds (tuples) loaded from config.txt.
+        # Regular (non-seed) peer connections.
+        self.peer_connections = SeedNodeConnections(ip, port)
+        # Seed node connections (mapping (ip, port) -> socket).
+        self.seed_connections = {}
+        # Known seed addresses (loaded from config.txt).
         self.known_seeds = []
-        # A dictionary to maintain topology updates received via broadcast.
+        # Known non-seed peer addresses.
+        self.known_peers = []
+        # Network topology stored as: { peer_identity: set(other_peer_identities) }
         self.network_topology = {}
+        # Log file name.
+        self.log_file = f"seed_log_{self.port}.txt"
+        self.log(f"Seed node started on {self.ip}:{self.port}")
         self.loadConfig()
+        self.writeSelfToConfig()
+
+    def log(self, message):
+        """Logs a message with a timestamp to stdout and to the log file."""
+        timestamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        log_message = f"{timestamp} - {message}"
+        print(log_message)
+        try:
+            with open(self.log_file, "a") as f:
+                f.write(log_message + "\n")
+        except Exception as e:
+            print("Error writing log:", e)
 
     def loadConfig(self):
-        """
-        Loads known seeds from config.txt.
-        Each line should be in the format ip:port.
-        Skips the node's own address.
-        """
         try:
             with open("config.txt", "r") as file:
                 lines = file.readlines()
@@ -89,42 +103,88 @@ class SeedNode:
                     if seed_tuple not in self.known_seeds:
                         self.known_seeds.append(seed_tuple)
                 except Exception as e:
-                    print("Error parsing line in config.txt:", line, e)
+                    self.log(f"Error parsing line in config.txt: {line} {e}")
         except Exception as e:
-            print("Failed to open config.txt:", e)
+            self.log(f"Failed to open config.txt: {e}")
+
+    def writeSelfToConfig(self):
+        my_info = f"{self.ip}:{self.port}"
+        try:
+            try:
+                with open("config.txt", "r") as file:
+                    lines = file.read().splitlines()
+            except FileNotFoundError:
+                lines = []
+            if my_info not in lines:
+                with open("config.txt", "a") as file:
+                    file.write(my_info + "\n")
+                self.log(f"Wrote self info to config.txt: {my_info}")
+            else:
+                self.log(f"Self info already present in config.txt: {my_info}")
+        except Exception as e:
+            self.log(f"Error writing to config.txt: {e}")
 
     def get_peer_subset(self):
-        """
-        Returns a subset of the current peer connections.
-        For example, if there are more than 3 connections, returns just the first three.
-        This list (of (ip, port) tuples) will be sent during the handshake.
-        """
-        keys = list(self.peer_connections.neighbour.keys())
-        if len(keys) > 3:
-            return keys[:3]
-        return keys
+        keys = [k for k in self.peer_connections.neighbour.keys() if k != (self.ip, self.port)]
+        return keys[:3] if len(keys) > 3 else keys
 
     def updatePeerConnections(self, new_peer, subset):
-        """
-        Updates the connection lists when a new connection is established.
-        For the new peer, adds all the peers in 'subset' as its connections.
-        For each peer in 'subset' that is already known locally, adds the new peer to that peer's connections.
-        Also updates the network_topology dictionary.
-        """
-        self.network_topology[new_peer] = subset
+        subset_set = set(subset)
+        if new_peer in self.network_topology:
+            self.network_topology[new_peer] = self.network_topology[new_peer].union(subset_set)
+        else:
+            self.network_topology[new_peer] = subset_set
+
+        for p in subset_set:
+            if p in self.network_topology:
+                self.network_topology[p].add(new_peer)
+            else:
+                self.network_topology[p] = {new_peer}
+
         if new_peer in self.peer_connections.neighbour:
             peer_instance = self.peer_connections.neighbour[new_peer]
-            for p in subset:
+            for p in subset_set:
                 peer_instance.add_connection(p)
                 if p in self.peer_connections.neighbour:
                     self.peer_connections.neighbour[p].add_connection(new_peer)
 
+    def powerlaw_connect(self, new_peer, num_connections=4, alpha=2.0):
+        available = [p for p in self.peer_connections.neighbour.keys() if p != new_peer]
+        if len(available) < 1:
+            self.log("Not enough peers available for power-law connection.")
+            return
+
+        sorted_peers = sorted(available, key=lambda p: len(self.peer_connections.neighbour[p].connections), reverse=True)
+        weights = [(i + 1) - alpha for i in range(len(sorted_peers))]
+        total = sum(weights)
+        probs = [w / total for w in weights]
+        selected = []
+        while len(selected) < min(num_connections, len(sorted_peers)):
+            idx = np.random.choice(len(sorted_peers), p=probs)
+            candidate = sorted_peers[idx]
+            if candidate not in selected:
+                selected.append(candidate)
+                probs[idx] = 0
+                total = sum(probs)
+                if total > 0:
+                    probs = [p / total for p in probs]
+        self.log(f"Power-law selected peers for {new_peer}: {selected}")
+        if new_peer not in self.network_topology:
+            self.network_topology[new_peer] = set()
+        for peer in selected:
+            self.network_topology[new_peer].add(peer)
+            if peer in self.network_topology:
+                self.network_topology[peer].add(new_peer)
+            else:
+                self.network_topology[peer] = {new_peer}
+        if new_peer in self.peer_connections.neighbour:
+            peer_instance = self.peer_connections.neighbour[new_peer]
+            for peer in selected:
+                peer_instance.add_connection(peer)
+                if peer in self.peer_connections.neighbour:
+                    self.peer_connections.neighbour[peer].add_connection(new_peer)
+
     def get_seeds_connected_to(self, new_peer):
-        """
-        Checks which connected seeds (from our direct connections)
-        have already recorded the new peer in their connections.
-        Returns a list of (ip, port) tuples.
-        """
         connected = []
         for seed, peer_obj in self.peer_connections.neighbour.items():
             if new_peer in peer_obj.connections:
@@ -132,267 +192,301 @@ class SeedNode:
         return connected
 
     def is_my_turn(self, new_peer, connected_seeds):
-        """
-        Determines if this node should send its connection list to the new peer.
-        It is given:
-          • new_peer: the (ip, port) tuple of the new peer,
-          • connected_seeds: a list of seeds (each as (ip, port)) that have connected to the new peer.
-        The function computes a hash from new_peer's ip+port, modulated by the total number of candidates.
-        Candidates is defined as the ordered (sorted) list of seeds that have connected to the new peer plus self.
-        If the candidate at the computed index equals this node's own address, returns True; otherwise, False.
-        """
         candidates = connected_seeds.copy()
         self_tuple = (self.ip, self.port)
         if self_tuple not in candidates:
             candidates.append(self_tuple)
         candidates.sort(key=lambda x: (x[0], x[1]))
-        hash_input = new_peer[0] + str(new_peer[1])
-        index = hash(hash_input) % len(candidates)
+        index = hash(new_peer[0] + str(new_peer[1])) % len(candidates)
         return candidates[index] == self_tuple
 
     def broadcastNewNodeUpdate(self, new_peer, subset):
-        """
-        Broadcasts a topology update to all connected seeds.
-        The message contains the new node's address and the connection list (subset) that is being sent.
-        """
-        # Use a pipe-delimited format: "NewNodeUpdate|<new_peer>|<subset>"
-        msg = f"NewNodeUpdate|{new_peer}|{subset}"
-        print("Broadcasting new node update:", msg)
+        msg = f"NewNodeUpdate|{new_peer}|{subset}\n"
+        self.log("Broadcasting new node update: " + msg.strip())
         self.broadcastMessage(msg)
 
     def handleNewNodeUpdate(self, msg):
-        """
-        Handles an incoming broadcast topology update.
-        Expects a message in the format: "NewNodeUpdate|<new_peer>|<subset>"
-        Parses the message and updates the local network_topology.
-        """
         try:
             parts = msg.split("|")
             if len(parts) != 3:
-                print("Malformed NewNodeUpdate message:", msg)
+                self.log("Malformed NewNodeUpdate message: " + msg)
                 return
-            new_peer = eval(parts[1])
-            subset = eval(parts[2])
-            # Update the local topology view.
-            self.network_topology[new_peer] = subset
-            if new_peer not in self.known_seeds:
-                self.known_seeds.append(new_peer)
-            print("Updated topology with new node:", new_peer, "connections:", subset)
+            new_peer = ast.literal_eval(parts[1].strip())
+            self.known_peers.append(new_peer)
+            subset = ast.literal_eval(parts[2].strip())
+            new_set = set(subset)
+            if new_peer in self.network_topology:
+                self.network_topology[new_peer] = self.network_topology[new_peer].union(new_set)
+            else:
+                self.network_topology[new_peer] = new_set
+            for p in self.network_topology[new_peer]:
+                if p in self.network_topology:
+                    self.network_topology[p].add(new_peer)
+                else:
+                    self.network_topology[p] = {new_peer}
+            if new_peer not in self.known_peers and new_peer not in self.known_seeds:
+                self.known_peers.append(new_peer)
+            self.log("Updated topology with new node: " + str(new_peer) +
+                     " connections: " + str(self.network_topology[new_peer]))
         except Exception as e:
-            print("Error handling NewNodeUpdate message:", e)
+            self.log("Error handling NewNodeUpdate message: " + str(e))
 
-    def setup(self) -> None:
+    def setup(self):
         self.socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         self.socket.bind((self.ip, self.port))
         self.socket.listen()
-        print(f"SeedNode is listening on {self.ip}:{self.port}")
+        self.log(f"SeedNode is listening on {self.ip}:{self.port}")
 
-    def acceptConnection(self) -> None:
-        """
-        Accepts incoming connections from other seeds.
-        Handshake protocol:
-          1. The connecting peer immediately sends its address.
-          2. This node adds the connection and stalls for 1 second.
-          3. It then checks which other seeds have connected to the same new peer.
-          4. It calls is_my_turn() with that list.
-             - If True, it gets its connection subset (via get_peer_subset) and sends it.
-             - Also, it broadcasts a NewNodeUpdate message to all connected seeds.
-             - Otherwise, it sends an empty list.
-          5. Finally, it updates its local connection lists.
-        """
+    def acceptConnection(self):
         while self.running:
             try:
                 clientSocket, clientAddress = self.socket.accept()
-                # Step 1: Immediately receive the new peer's address.
-                data = clientSocket.recv(1024).decode()
-                new_peer = eval(data)  # Expected as a tuple, e.g. ('127.0.0.1', 8000)
-                print("New connection from:", new_peer)
-                if new_peer not in self.known_seeds:
-                    self.known_seeds.append(new_peer)
-                # Step 2: Add the new connection.
+                f = clientSocket.makefile('r')
+                handshake = f.readline().strip()
+                if handshake.startswith("I am seed"):
+                    try:
+                        parts = handshake.split("|")
+                        if len(parts) != 2:
+                            raise Exception("Malformed handshake")
+                        remote_seed = ast.literal_eval(parts[1].strip())
+                    except Exception as e:
+                        self.log("Error parsing seed handshake: " + str(e))
+                        clientSocket.close()
+                        continue
+                    if remote_seed not in self.seed_connections:
+                        self.seed_connections[remote_seed] = clientSocket
+                        if remote_seed not in self.known_seeds:
+                            self.known_seeds.append(remote_seed)
+                        self.log("Seed connection accepted from " + str(remote_seed))
+                        reply = f"I am seed|{(self.ip, self.port)}\n"
+                        clientSocket.sendall(reply.encode())
+                        clientSocket.settimeout(None)
+                        time.sleep(0.1)
+                        heartbeat = f"Heartbeat from {(self.ip, self.port)}\n"
+                        clientSocket.sendall(heartbeat.encode())
+                        threading.Thread(target=self.handle_client, args=(clientSocket,), daemon=True).start()
+                    else:
+                        self.log("Duplicate seed connection from " + str(remote_seed))
+                        clientSocket.close()
+                    continue
+
+                try:
+                    new_peer = ast.literal_eval(handshake)
+                except Exception as e:
+                    self.log("Error parsing peer handshake, closing connection. " + str(e))
+                    clientSocket.close()
+                    continue
+
+                self.log("Peer connection accepted from: " + str(new_peer))
                 if self.peer_connections.addNeighbour(new_peer[0], new_peer[1], clientSocket):
-                    output = "Connection accepted from " + str(new_peer)
-                    print(output)
-                    self.writeLog(output)
-                    # Stall for 1 second.
                     time.sleep(1)
-                    # Step 3: Check which seeds already have this new peer.
                     connected_seeds = self.get_seeds_connected_to(new_peer)
-                    # Step 4: Determine if it is this node’s turn.
                     if self.is_my_turn(new_peer, connected_seeds):
                         subset = self.get_peer_subset()
-                        # Send the connection list to the new peer.
-                        clientSocket.send(pickle.dumps(subset))
-                        # Additionally, broadcast the new node update so that all seeds update their topology.
+                        clientSocket.sendall(pickle.dumps(subset) + b"\n")
                         self.broadcastNewNodeUpdate(new_peer, subset)
                     else:
                         subset = []
-                        clientSocket.send(pickle.dumps(subset))
-                    # Step 5: Update local connection lists.
+                        clientSocket.sendall(pickle.dumps(subset) + b"\n")
                     self.updatePeerConnections(new_peer, subset)
-                    threading.Thread(target=self.handle_client, args=(clientSocket,)).start()
+                    clientSocket.settimeout(None)
+                    threading.Thread(target=self.handle_client, args=(clientSocket,), daemon=True).start()
                 else:
-                    output = "Duplicate connection from " + str(new_peer)
-                    print(output)
-                    self.writeLog(output)
+                    self.log("Duplicate peer connection from " + str(new_peer))
                     clientSocket.close()
             except Exception as e:
-                print("Error accepting connection:", e)
+                self.log("Error accepting connection: " + str(e))
                 continue
 
+    def connectToSeed(self, seed):
+        ip, port = seed
+        try:
+            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            sock.settimeout(5)
+            sock.connect((ip, port))
+            handshake = f"I am seed|{(self.ip, self.port)}\n"
+            sock.sendall(handshake.encode())
+            f = sock.makefile('r')
+            reply = f.readline().strip()
+            if reply.startswith("I am seed"):
+                try:
+                    parts = reply.split("|")
+                    if len(parts) != 2:
+                        raise Exception("Malformed handshake reply")
+                    remote_seed = ast.literal_eval(parts[1].strip())
+                except Exception as e:
+                    self.log("Error parsing handshake reply: " + str(e))
+                    sock.close()
+                    return
+                sock.settimeout(None)
+                self.seed_connections[remote_seed] = sock
+                if remote_seed not in self.known_seeds:
+                    self.known_seeds.append(remote_seed)
+                self.log("Connected to seed " + str(remote_seed))
+                time.sleep(0.1)
+                heartbeat = f"Heartbeat from {(self.ip, self.port)}\n"
+                sock.sendall(heartbeat.encode())
+                threading.Thread(target=self.handle_client, args=(sock,), daemon=True).start()
+            else:
+                self.log("Unexpected handshake reply from seed " + str((ip, port)))
+                sock.close()
+        except Exception as e:
+            self.log("Could not connect to seed " + str(seed) + " error: " + str(e))
+
     def connectToSeedsFromConfig(self):
-        """
-        Periodically tries to connect to each known seed (from config and discovered)
-        that isn't already connected.
-        For an outgoing connection, the protocol is:
-          1. Immediately send this node's address.
-          2. Wait to receive the connection list (which may be empty) from the remote seed.
-          3. Update local connection lists accordingly.
-        """
         while self.running:
             for seed in self.known_seeds:
-                if seed not in self.peer_connections.neighbour:
-                    ip, port = seed
-                    try:
-                        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-                        sock.settimeout(5)
-                        sock.connect((ip, port))
-                        # Immediately send our address.
-                        sock.send(str((self.ip, self.port)).encode())
-                        # Wait for the remote seed to decide which connection list to send.
-                        data = sock.recv(1024)
-                        remote_subset = pickle.loads(data)
-                        print(f"Received peer subset from seed {(ip, port)}: {remote_subset}")
-                        if self.peer_connections.addNeighbour(ip, port, sock):
-                            output = f"Connected to seed {(ip, port)}"
-                            print(output)
-                            self.writeLog(output)
-                            # Update local connection lists based on the remote subset.
-                            self.updatePeerConnections((ip, port), remote_subset)
-                            threading.Thread(target=self.handle_client, args=(sock,)).start()
-                        else:
-                            print("Duplicate connection to", (ip, port))
-                            sock.close()
-                    except Exception as e:
-                        print("Could not connect to seed", (ip, port), "error:", e)
-                        continue
-            time.sleep(10)
+                if seed not in self.seed_connections:
+                    threading.Thread(target=self.connectToSeed, args=(seed,), daemon=True).start()
+            time.sleep(15)
 
     def broadcastMessage(self, message):
-        """
-        Broadcasts a message to all connected peers.
-        This function is independent and can be called programmatically.
-        """
-        print("Broadcasting message:", message)
-        for peer, peer_obj in list(self.peer_connections.neighbour.items()):
+        self.log("Broadcasting message: " + message.strip())
+        for seed, sock in list(self.seed_connections.items()):
             try:
-                peer_obj.socket.send(message.encode())
+                sock.sendall(message.encode())
             except Exception as e:
-                print(f"Error sending to {peer}: {e}")
-                self.peer_connections.removeNeighbour(peer[0], peer[1])
+                self.log(f"Error sending to seed {seed}: {e}")
+                self.seed_connections.pop(seed, None)
 
     def periodicBroadcast(self):
-        """
-        Periodically broadcasts a heartbeat message.
-        Adjust the message and interval as needed.
-        """
         while self.running:
-            message = f"Heartbeat from {(self.ip, self.port)}"
+            message = f"Heartbeat from {(self.ip, self.port)}\n"
             self.broadcastMessage(message)
             time.sleep(15)
 
     def removeDeadNode(self, deadMessage) -> None:
-        """
-        Removes a dead node when a message of the form "Dead Node:(ip, port)" is received.
-        """
-        messageParts = deadMessage.split(":")
-        if messageParts[0] == "Dead Node":
-            deadNode = eval(messageParts[1])
-            if self.peer_connections.removeNeighbour(deadNode[0], deadNode[1]):
-                output = "Removed dead node: " + str(deadNode)
-                print(output)
-                self.writeLog(output)
+        deadMessage = deadMessage.strip()
+        parts = deadMessage.split(":", 1)
+        if parts[0] == "Dead Node":
+            try:
+                reported = ast.literal_eval(parts[1].strip())
+            except Exception as e:
+                self.log("Error parsing dead node message: " + str(e))
+                return
+            # Look up the peer in network_topology by matching both IP and port.
+            found = None
+            for peer in list(self.network_topology.keys()):
+                if peer[0] == reported[0] and peer[1] == reported[1]:
+                    found = peer
+                    break
+            if found is None:
+                self.log("Dead node " + str(reported) + " not found in network topology; no broadcast sent.")
+                return
+
+            deadNode = found
+
+            # Remove from peer_connections.
+            removed = self.peer_connections.removeNeighbour(deadNode[0], deadNode[1])
+            if removed:
+                self.log("Removed dead node from peer_connections: " + str(deadNode))
+            else:
+                self.log("Dead node " + str(deadNode) + " not found in peer_connections; proceeding with removal.")
+
+            # Completely remove deadNode from network_topology.
+            if deadNode in self.network_topology:
+                del self.network_topology[deadNode]
+            for node in list(self.network_topology.keys()):
+                if deadNode in self.network_topology[node]:
+                    self.network_topology[node].discard(deadNode)
+
+            # Also remove from known_peers.
+            if deadNode in self.known_peers:
+                self.known_peers.remove(deadNode)
+
+            self.log("Completely removed dead node: " + str(deadNode))
+            self.broadcastMessage(f"Dead Node: {deadNode}\n")
+
+            # Also remove from known_peers.
+            if deadNode in self.known_peers:
+                self.known_peers.remove(deadNode)
+
+            self.log("Completely removed dead node: " + str(deadNode))
+            # Broadcast a clean dead node message.
+            self.broadcastMessage(f"Dead Node: {deadNode}\n")
 
     def writeLog(self, content):
-        """
-        Logs the provided content to a file named seed_log_<port>.txt.
-        """
-        file_path = "seed_log_" + str(self.port) + '.txt'
-        with open(file_path, 'a') as file:
-            file.write(content + '\n')
+        try:
+            with open(self.log_file, 'a') as file:
+                file.write(content + "\n")
+        except Exception as e:
+            print("Error writing log to file:", e)
 
     def handle_client(self, client_socket):
-        """
-        Handles communication with a connected peer.
-        Receives messages and processes them. Also checks for NewNodeUpdate messages
-        to update the local topology.
-        """
+        try:
+            peer_addr = client_socket.getpeername()
+        except Exception as e:
+            peer_addr = "unknown"
+        f = client_socket.makefile('r')
         while self.running:
             try:
-                message = client_socket.recv(1024).decode()
-                if not message:
-                    client_socket.close()
-                    break
-                # If the message is a topology update, process it.
-                if message.startswith("NewNodeUpdate|"):
-                    self.handleNewNodeUpdate(message)
-                else:
-                    self.removeDeadNode(message)
-                    print("Received message:", message)
-                    self.writeLog(message)
+                raw_data = f.readline()
+                if not raw_data:
+                    time.sleep(5)
+                    continue
+                for line in raw_data.split("\n"):
+                    line = line.strip()
+                    if not line:
+                        continue
+                    self.log(f"Received message from {peer_addr}: {line}")
+                    if line.startswith("NewNodeUpdate|"):
+                        self.handleNewNodeUpdate(line)
+                    elif line.startswith("Dead Node"):
+                        try:
+                            self.removeDeadNode(line)
+                            self.log(f"Processed dead node message from {peer_addr}: {line}")
+                        except Exception as e:
+                            self.log(f"Corrupted dead node message from {peer_addr}: {line}; Error: {e}")
+                    else:
+                        self.log(f"Unrecognized message from {peer_addr}: {line}")
             except Exception as e:
-                print("Error in handle_client:", e)
+                self.log(f"Corrupted message from {peer_addr}: {raw_data if 'raw_data' in locals() else 'unknown'}; Error: {e}")
                 break
 
     def acceptInput(self):
-        """
-        Accepts user input solely for shutdown purposes.
-        (Broadcasting is handled automatically.)
-        """
         while self.running:
             user_input = input().strip()
             if user_input.lower() == "exit":
-                print("Shutting down the seed node...")
+                self.log("Shutting down the seed node...")
                 self.running = False
                 self.socket.close()
                 break
             else:
-                print("Unrecognized command. Use 'exit' to shut down.")
+                self.log("Unrecognized command. Use 'exit' to shut down.")
 
     def activate(self):
-        # Start thread to accept incoming connections.
-        threading.Thread(target=self.acceptConnection).start()
-        # Start thread to periodically connect to seeds.
-        threading.Thread(target=self.connectToSeedsFromConfig).start()
-        # Start thread for periodic broadcast independent of user input.
-        threading.Thread(target=self.periodicBroadcast).start()
-        # Start thread to accept shutdown commands from the keyboard.
-        threading.Thread(target=self.acceptInput).start()
+        threading.Thread(target=self.acceptConnection, daemon=True).start()
+        threading.Thread(target=self.connectToSeedsFromConfig, daemon=True).start()
+        threading.Thread(target=self.periodicBroadcast, daemon=True).start()
+        threading.Thread(target=self.acceptInput, daemon=True).start()
 
     def printPeerConnections(self):
-        """
-        Optional helper to print all current peer connections (for debugging).
-        """
-        print("Current Peer Connections:")
+        self.log("Current Regular Peer Connections:")
         for peer_tuple, peer_obj in self.peer_connections.neighbour.items():
-            print(peer_obj)
+            self.log(str(peer_obj))
+        self.log("Current Seed Connections:")
+        for seed in self.seed_connections:
+            self.log(str(seed))
+        self.log("Known Seeds: " + str(self.known_seeds))
+        self.log("Known Peers (non-seed): " + str(self.known_peers))
+        self.log("Network Topology:")
+        self.log(str(self.network_topology))
 
     def __del__(self):
         if self.socket:
             self.socket.close()
 
-
 def main():
     ip = "127.0.0.1"
-    port = int(input("Enter Seed Port Number : "))
+    port = int(input("Enter Seed Port Number: "))
     seed = SeedNode(ip, port)
     seed.setup()
     seed.activate()
-    # For debugging: periodically print the current peer connections.
     while seed.running:
         time.sleep(30)
         seed.printPeerConnections()
-
+    print("Final Network Topology:")
+    print(seed.network_topology)
 
 if __name__ == "__main__":
     main()
